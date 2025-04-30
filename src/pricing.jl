@@ -10,10 +10,45 @@ using ..Types: Price, OptionContract, MarketState, SimConfig
 
 # Import only what's needed from standard libraries and packages
 using Random: AbstractRNG, rand, MersenneTwister
-using Distributions: Normal
+using Distributions: Normal, cdf # Need cdf for BS
 using Statistics: mean, std
 using GLM: lm, predict, @formula  # Import GLM for regression
 using DataFrames: DataFrame # Needed for GLM
+
+# Export functions
+export price_american_mc, calculate_option_greeks, calculate_bs_delta
+
+"""
+calculate_bs_delta(S::Float64, K::Float64, T::Float64, r::Float64, σ::Float64, is_call::Bool) -> Float64
+
+Calculates the Black-Scholes delta for a European option.
+"""
+function calculate_bs_delta(S::Float64, K::Float64, T::Float64, r::Float64, σ::Float64, is_call::Bool) :: Float64
+    # Ensure inputs are valid
+    if S <= 0 || K <= 0 || T <= 0 || σ <= 0
+        # Handle edge cases: return theoretical delta at expiration or if invalid
+        if T <= 1e-9 # Approximately zero time left
+            if is_call
+                return S > K ? 1.0 : 0.0
+            else # Put
+                return S < K ? -1.0 : 0.0
+            end
+        else
+             return 0.0 # Or NaN, depending on desired behavior for invalid inputs
+        end
+       
+    end
+
+    d1 = (log(S / K) + (r + 0.5 * σ^2) * T) / (σ * sqrt(T))
+    
+    if is_call
+        delta = cdf(Normal(0, 1), d1)
+    else # Put
+        delta = cdf(Normal(0, 1), d1) - 1.0
+    end
+    
+    return delta
+end
 
 """
 price_american_mc(opt::OptionContract, state::MarketState, config::SimConfig, rng::AbstractRNG, estimated_volatility::Float64) -> Float64

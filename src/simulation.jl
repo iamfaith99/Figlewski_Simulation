@@ -63,8 +63,16 @@ function run_simulation(config::SimConfig, n_steps::Int)
 
     # --- Data Logging Initialization ---
     price_history = [state.prices["STOCK"].value]
-    # Add other histories if needed, e.g., agent-specific data
-    
+    # New Histories:
+    delta_history = Float64[]
+    spread_history = Float64[]
+    volume_history = Float64[]
+    # Store capital history per agent {AgentID => [Capital]}
+    agent_capital_history = Dict{Int, Vector{Float64}}(
+        agent.id => [agent.capital] for agent in agents
+    )
+    option_price_history = Float64[] # Also track option price for plotting
+
     println("Starting simulation...")
     # Main simulation loop
     for step in 1:n_steps
@@ -106,6 +114,31 @@ function run_simulation(config::SimConfig, n_steps::Int)
         
         # --- Market Update Phase ---
         ob, trades = update_orderbook(ob, orders, state, config, opt) 
+
+        # --- Collect Market Data (Post-Trade) ---
+        # Volume
+        step_volume = sum(trade[:trade_size] for trade in trades; init=0.0)
+        push!(volume_history, step_volume)
+
+        # Spread (Handle empty book case)
+        best_bid = isempty(ob.bids) ? -Inf : first(ob.bids)[1] # price is first element
+        best_ask = isempty(ob.asks) ? Inf : first(ob.asks)[1] # price is first element
+        step_spread = best_ask - best_bid
+        push!(spread_history, (isinf(step_spread) || step_spread < 0) ? NaN : step_spread) # Store NaN if invalid/infinite
+
+        # Option Price (from OrderBook mid-price or last trade)
+        # Use mid-price if available, otherwise last trade, otherwise NaN
+        option_mid_price = (best_bid > -Inf && best_ask < Inf) ? (best_bid + best_ask) / 2 : NaN
+        last_option_trade_price = NaN
+        for trade in Iterators.reverse(trades) # Check recent trades first
+            if trade[:type] == :option
+                last_option_trade_price = trade[:trade_price]
+                break
+            end
+        end
+        current_option_price = !isnan(option_mid_price) ? option_mid_price : last_option_trade_price
+        # Fallback if no trades and no valid mid-price (maybe use previous step's?) - for now, keep NaN if undetermined
+        push!(option_price_history, current_option_price)
 
         # --- Process Trades and Update Agents --- 
         for trade in trades
@@ -179,18 +212,33 @@ function run_simulation(config::SimConfig, n_steps::Int)
 
         # --- Market State Evolution --- 
         state = evolve_market(state, config, rng)  # Evolve underlying price/vol
-        push!(price_history, state.prices["STOCK"].value) # Log new price
+        push!(price_history, state.prices["STOCK"].value) # Log new stock price
 
-        # --- Update Agent Portfolio History (End of Step) ---
+        # --- Calculate Delta (End of Step) ---
+        S = state.prices["STOCK"].value
+        K = opt.strike
+        T = max(1e-9, (n_steps - step) / n_steps) # Time to expiry in years, ensure > 0
+        # Use risk_premium as r? Or 0? Using 0 for theoretical delta for now.
+        r = 0.0 
+        # Which sigma? Use market state's sigma for now.
+        sigma = state.volatility["STOCK"]
+        # Handle T=0 case (expiration) - already handled by Pricing.calculate_delta if T is small but positive
+        step_delta = Pricing.calculate_bs_delta(S, K, T, r, sigma, opt.is_call) # Use calculate_bs_delta
+        push!(delta_history, step_delta)
+
+        # --- Update Agent Portfolio & Capital History (End of Step) ---
         for agent in agents
             # Calculate current portfolio value: Capital + MTM value of stock position
             # Use get() for agent.position to handle cases where agent has no stock position
             mtm_position_value = get(agent.position, "STOCK", 0.0) * state.prices["STOCK"].value
             current_portfolio_value = agent.capital + mtm_position_value
             push!(agent.portfolio_history, current_portfolio_value)
+
+            # Capital History (Log current capital)
+            push!(agent_capital_history[agent.id], agent.capital)
         end
 
-        # --- Diagnostics (Optional) ---
+        # Optional: Print progress
         if step % 50 == 0 || step == n_steps
             println("Step $step/$n_steps completed. Price: $(round(state.prices["STOCK"].value, digits=2))")
         end
@@ -198,8 +246,8 @@ function run_simulation(config::SimConfig, n_steps::Int)
     
     println("Simulation finished.")
     
-    # Return final agent states and price history
-    return agents, price_history # Return agents for detailed analysis
+    # Return final agent states and ALL collected histories
+    return agents, price_history, option_price_history, delta_history, spread_history, volume_history, agent_capital_history
 end
 
 function initialize_agents(config::SimConfig, option::OptionContract, initial_state::MarketState) :: Vector{Entrepreneur}

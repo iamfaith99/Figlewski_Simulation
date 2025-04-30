@@ -46,50 +46,82 @@ n_steps = 252 # Define number of steps (e.g., 1 year)
 println("Running Catallaxy Model simulation...")
 
 # --- Run Simulation ---
-# Simulation now returns the list of agents and price history
-final_agents, price_history = run_simulation(config, n_steps)
+# Capture all returned histories
+final_agents, stock_price_history, option_price_history, delta_history, spread_history, volume_history, agent_capital_history = run_simulation(config, n_steps)
 
 # --- Extract Data for Analysis ---
 agent_ids = [agent.id for agent in final_agents]
 agent_roles = [agent.role for agent in final_agents]
-final_capitals = [agent.capital for agent in final_agents]
-initial_capitals = [agent.initial_capital for agent in final_agents]
-accumulated_costs = [agent.accumulated_costs for agent in final_agents]
-portfolio_histories = [agent.portfolio_history for agent in final_agents]
+# agent_capital_history is already a Dict {ID -> History}
 
-# Calculate P&L
-final_pnl = [hist[end] - hist[1] for hist in portfolio_histories]
+# --- Calculate P&L History ---
+agent_pnl_history = Dict{Int, Vector{Float64}}()
+for agent_id in agent_ids
+    initial_capital = agent_capital_history[agent_id][1] # First element is initial capital
+    agent_pnl_history[agent_id] = [cap - initial_capital for cap in agent_capital_history[agent_id]]
+end
 
 # --- Summary Statistics ---
 println("\nSummary Statistics:")
 println("==================")
-@printf("Mean Spot Price: %.8f\n", mean(price_history))
+# Calculate mean price from step 1 onwards, excluding initial price if desired
+mean_stock_price = mean(stock_price_history[2:end])
+@printf("Mean Spot Price (Steps 1-%d): %.8f\n", n_steps, mean_stock_price)
+
 # Add agent-specific summaries
 println("\nAgent Final States:")
 println("-------------------")
 for i in 1:length(final_agents)
-    @printf("Agent %d (%s):\n", agent_ids[i], agent_roles[i])
-    @printf("  Final Capital:      %.2f\n", final_capitals[i])
-    @printf("  Accumulated Costs:  %.2f\n", accumulated_costs[i])
-    @printf("  Total P&L:          %.2f\n", final_pnl[i])
+    agent_id = agent_ids[i]
+    final_capital = agent_capital_history[agent_id][end]
+    initial_capital = agent_capital_history[agent_id][1]
+    accumulated_costs = final_agents[i].accumulated_costs # Get from agent struct
+    final_pnl = final_capital - initial_capital
+    @printf("Agent %d (%s):\n", agent_id, agent_roles[i])
+    @printf("  Final Capital:      %.2f\n", final_capital)
+    @printf("  Accumulated Costs:  %.2f\n", accumulated_costs)
+    @printf("  Total P&L:          %.2f\n", final_pnl)
 end
 
 # --- Generate Plots ---
 println("\nGenerating plots...")
 
-# 1. Spot Price History
-p1 = plot(1:length(price_history), price_history, title="Spot Price Evolution", xlabel="Step", ylabel="Price", legend=false)
+# Define time steps for plotting
+steps_state = 0:n_steps  # For stock price, agent capital/pnl (n_steps + 1 points)
+steps_market = 1:n_steps # For option price, delta, spread, volume (n_steps points)
 
-# 2. Agent Capital History
-p2 = plot(title="Agent Capital Over Time", xlabel="Step", ylabel="Capital")
-for i in 1:length(final_agents)
-    # Need to extract capital history (requires modification to simulation.jl or calculate from portfolio history)
-    # For now, let's plot portfolio value as a proxy
-    plot!(p2, 1:length(portfolio_histories[i]), portfolio_histories[i], label="Agent $(agent_ids[i]) ($(agent_roles[i]))")
+# 1. Prices (Stock & Option)
+p_prices = plot(steps_state, stock_price_history, label="Stock Price", title="Prices", xlabel="Step", ylabel="Price", legend=:topright)
+# Plot option price against steps 1 to n_steps
+plot!(p_prices, steps_market, option_price_history, label="Option Price", linestyle=:dash)
+
+# 2. Option Delta
+p_delta = plot(steps_market, delta_history, title="Option Delta (BS)", xlabel="Step", ylabel="Delta", label="Delta", color=:red)
+
+# 3. Bid-Ask Spread
+# Filter out NaNs for plotting if necessary, or Plots.jl might handle them
+p_spread = plot(steps_market, spread_history, title="Bid-Ask Spread", xlabel="Step", ylabel="Spread", label="Spread", color=:green)
+
+# 4. Trade Volume
+p_volume = plot(steps_market, volume_history, title="Trade Volume", xlabel="Step", ylabel="Volume", label="Volume", color=:purple, linetype=:steppre) # Use step plot for volume
+
+# 5. Agent Capital
+p_capital = plot(title="Agent Capital", xlabel="Step", ylabel="Capital", legend=:outertopright)
+for agent_id in agent_ids
+    role = agent_roles[findfirst(id -> id == agent_id, agent_ids)]
+    plot!(p_capital, steps_state, agent_capital_history[agent_id], label="Agent $agent_id ($role)")
+end
+
+# 6. Agent P&L
+p_pnl = plot(title="Agent P&L", xlabel="Step", ylabel="P&L", legend=:outertopright)
+for agent_id in agent_ids
+    role = agent_roles[findfirst(id -> id == agent_id, agent_ids)]
+    plot!(p_pnl, steps_state, agent_pnl_history[agent_id], label="Agent $agent_id ($role)")
 end
 
 # Combine plots
-combined_plot = plot(p1, p2, layout=(2, 1), size=(800, 600))
+combined_plot = plot(p_prices, p_delta, p_spread, p_volume, p_capital, p_pnl,
+                     layout=(3, 2), size=(1200, 900), margin=5Plots.mm) # Add margin
 
 # Save plot
 plot_filename = "catallaxy_agent_results.png"

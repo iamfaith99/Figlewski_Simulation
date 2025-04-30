@@ -33,7 +33,7 @@ const MaybeFloat = Union{Float64,Missing}
 # --- Simulation configuration ---
 struct SimConfig
     npaths::Int                             # Number of MC paths for pricing
-    seed::Int                               # Master RNG seed
+    seed::UInt                              # Master RNG seed
     risk_premium::Float64                 # Risk premium used in MC drift
     mm_transaction_cost::Float64          # Market maker transaction cost
     retail_transaction_cost::Float64      # Retail trader transaction cost
