@@ -26,8 +26,9 @@ update_orderbook(ob::OrderBook, orders::Vector{Dict{Symbol, Any}}, state::Market
 function update_orderbook(ob::OrderBook, orders::Vector{Dict{Symbol, Any}}, state::MarketState, config::SimConfig, option::OptionContract)
     trades = Dict{Symbol, Any}[] # Initialize list for trades
     # Use deep copies to avoid modifying the original order book state unintentionally
-    updated_bids = deepcopy(ob.bids)
-    updated_asks = deepcopy(ob.asks)
+    # Deep copy needs to handle the new tuple structure
+    updated_bids = deepcopy(ob.bids) # Now Vector{Tuple{Price, Size, AgentID, Role}}
+    updated_asks = deepcopy(ob.asks) # Now Vector{Tuple{Price, Size, AgentID, Role}}
     
     # Separate orders by type (stock vs option) and option key
     stock_orders = filter(o -> o[:type] == :stock, orders)
@@ -96,59 +97,88 @@ function update_orderbook(ob::OrderBook, orders::Vector{Dict{Symbol, Any}}, stat
 
     # Match orders for each option key separately
     for (option_key, key_orders) in grouped_option_orders
-        option_bids = filter(o -> o[:side] == :buy, key_orders)
-        option_asks = filter(o -> o[:side] == :sell, key_orders)
-        sort!(option_bids, by=x->x[:price], rev=true)
-        sort!(option_asks, by=x->x[:price])
+        # --- Combine Incoming and Resting Orders --- 
+        for order in key_orders
+            price = Price(order[:price])
+            size = order[:size]
+            agent_id = order[:agent_id]
+            agent_role = order[:agent_role]
+            target_list = order[:side] == :buy ? updated_bids : updated_asks
+            
+            # Find if price level exists (matching on Price only)
+            found_idx = findfirst(item -> item[1] == price, target_list)
+            if !isnothing(found_idx)
+                # Aggregate size and store *one* agent's info (e.g., the last one)
+                # TODO: A better approach would handle multiple orders at the same price level
+                # For now, just update the size and overwrite agent info
+                existing_price, existing_size, _, _ = target_list[found_idx]
+                target_list[found_idx] = (existing_price, existing_size + size, agent_id, agent_role)
+            else
+                # Append new price level with agent info
+                push!(target_list, (price, size, agent_id, agent_role))
+            end
+        end
+        
+        # --- Sort Combined Book --- 
+        # Sort by price (primary), potentially add secondary sort later if needed
+        sort!(updated_bids, by=item->item[1], rev=true) # Highest bid first
+        sort!(updated_asks, by=item->item[1])          # Lowest ask first
 
-        # --- Option Matching Logic (Similar to Stock) ---
-        bid_idx, ask_idx = 1, 1
-        while bid_idx <= length(option_bids) && ask_idx <= length(option_asks)
-            best_bid = option_bids[bid_idx]
-            best_ask = option_asks[ask_idx]
+        # --- Option Matching Logic (on combined book) ---
+        while !isempty(updated_bids) && !isempty(updated_asks)
+            best_bid_price, best_bid_size, buyer_id, buyer_role = first(updated_bids)
+            best_ask_price, best_ask_size, seller_id, seller_role = first(updated_asks)
 
-            if best_bid[:price] >= best_ask[:price]
-                trade_price = (best_bid[:price] + best_ask[:price]) / 2
-                trade_size = min(best_bid[:size], best_ask[:size])
+            if best_bid_price >= best_ask_price # Market crossed or touched
+                trade_price = (best_bid_price.value + best_ask_price.value) / 2 # Mid-point execution
+                trade_size = min(best_bid_size, best_ask_size)
 
-                buyer_id = best_bid[:agent_id]
-                seller_id = best_ask[:agent_id]
-                buyer_role = best_bid[:agent_role]
-                seller_role = best_ask[:agent_role]
-                buyer_cost_total = apply_costs(trade_price, trade_size, :buy, buyer_role, config, state, option)
+                # --- Calculate Costs using Agent Info from Book --- 
+                # Note: This uses the agent info associated with the *first* tuple at the BBO.
+                # If multiple orders were aggregated, this might not be fully accurate.
+                buyer_cost_total = apply_costs(trade_price, trade_size, :buy, buyer_role, config, state, option) 
                 seller_cost_total = apply_costs(trade_price, trade_size, :sell, seller_role, config, state, option)
 
                 push!(trades, Dict(
                     :trade_price => trade_price,
                     :trade_size => trade_size,
-                    :buyer_id => buyer_id,
-                    :seller_id => seller_id,
-                    :buyer_cost => buyer_cost_total, 
-                    :seller_cost => seller_cost_total,
-                    :type => :option, # Identify trade type
-                    :option_key => option_key # Include the specific option key
+                    :buyer_id => buyer_id, # Use ID from book tuple
+                    :seller_id => seller_id, # Use ID from book tuple
+                    :buyer_cost => buyer_cost_total,
+                    :seller_cost => seller_cost_total, 
+                    :type => :option,
+                    :option_key => option_key
                 ))
 
-                best_bid[:size] -= trade_size
-                best_ask[:size] -= trade_size
+                # Update remaining sizes in the book state
+                new_bid_size = best_bid_size - trade_size
+                new_ask_size = best_ask_size - trade_size
 
-                if best_bid[:size] < 1e-9; bid_idx += 1; end
-                if best_ask[:size] < 1e-9; ask_idx += 1; end
+                # Remove filled levels or update remaining size
+                if new_bid_size < 1e-9
+                    popfirst!(updated_bids)
+                else
+                    # Update size, keep other info
+                    updated_bids[1] = (best_bid_price, new_bid_size, buyer_id, buyer_role) 
+                end
+
+                if new_ask_size < 1e-9
+                    popfirst!(updated_asks)
+                else
+                     # Update size, keep other info
+                    updated_asks[1] = (best_ask_price, new_ask_size, seller_id, seller_role)
+                end
             else
-                break
+                break # Bids and asks do not cross
             end
         end
-        # Note: Remaining unmatched option orders are also discarded here.
-    end
+        # --- Combined book state is now updated after matching --- 
+    end # End loop over option keys
 
-    # Convert SortedDicts to Vector{Tuple{Price, Float64}} for the constructor
-    bids_vector = [(Price(k.value), v) for (k, v) in updated_bids]
-    asks_vector = [(Price(k.value), v) for (k, v) in updated_asks]
+    # Ensure book depth is maintained (truncate if needed) - Not implemented yet
     
-    # Construct the updated OrderBook object with correct types and depth argument
-    updated_ob = OrderBook(bids_vector, asks_vector, 0) # Using 0 as placeholder depth
-
-    # Return the updated order book and the list of trades
+    # Return the updated order book (containing agent info) and trades
+    updated_ob = OrderBook(updated_bids, updated_asks) # Use updated lists directly
     return updated_ob, trades 
 end
 

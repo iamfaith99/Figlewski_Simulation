@@ -44,7 +44,7 @@ function run_simulation(config::SimConfig, n_steps::Int)
     )
     
     # Initialize order book
-    ob = OrderBook([], [], 5)                         # Empty book with depth 5
+    ob = OrderBook()                         # Use default empty book constructor
     
     # Define option contract
     opt = OptionContract(
@@ -76,6 +76,28 @@ function run_simulation(config::SimConfig, n_steps::Int)
     println("Starting simulation...")
     # Main simulation loop
     for step in 1:n_steps
+        # --- Update All Agents' Volatility Estimates --- 
+        # Before agents decide actions, update their view of market vol based on current price
+        current_stock_price = state.prices["STOCK"].value
+        for agent in agents
+            asset_key = "STOCK"
+            # Ensure history vector exists
+            if !haskey(agent.price_history, asset_key); agent.price_history[asset_key] = Float64[]; end
+            # Append current market price
+            push!(agent.price_history[asset_key], current_stock_price)
+            # Keep history within lookback window
+            if length(agent.price_history[asset_key]) > config.vol_lookback + 1
+                popfirst!(agent.price_history[asset_key])
+            end
+            # Recalculate estimated volatility
+            agent.estimated_volatility[asset_key] = calculate_volatility(agent.price_history[asset_key])
+            # Handle potential NaN from calculate_volatility (e.g., if history is still too short)
+            if isnan(agent.estimated_volatility[asset_key])
+                agent.estimated_volatility[asset_key] = 0.0 # Default to 0 vol if NaN
+                # Or consider using the market state vol: state.volatility[asset_key]
+            end
+        end
+        
         # --- Agent Actions Phase ---
         orders = Dict{Symbol, Any}[] # Initialize with specific type
         for agent in agents
@@ -123,23 +145,34 @@ function run_simulation(config::SimConfig, n_steps::Int)
         # Spread (Handle empty book case)
         best_bid = isempty(ob.bids) ? -Inf : first(ob.bids)[1] # price is first element
         best_ask = isempty(ob.asks) ? Inf : first(ob.asks)[1] # price is first element
-        step_spread = best_ask - best_bid
-        push!(spread_history, (isinf(step_spread) || step_spread < 0) ? NaN : step_spread) # Store NaN if invalid/infinite
-
-        # Option Price (from OrderBook mid-price or last trade)
-        # Use mid-price if available, otherwise last trade, otherwise NaN
-        option_mid_price = (best_bid > -Inf && best_ask < Inf) ? (best_bid + best_ask) / 2 : NaN
-        last_option_trade_price = NaN
-        for trade in Iterators.reverse(trades) # Check recent trades first
-            if trade[:type] == :option
-                last_option_trade_price = trade[:trade_price]
-                break
-            end
+        step_spread = if !ismissing(best_bid) && !ismissing(best_ask)
+            # Extract values before subtraction, handling potential Inf/-Inf
+            ask_val = isa(best_ask, Price) ? best_ask.value : best_ask # Get Float64 value
+            bid_val = isa(best_bid, Price) ? best_bid.value : best_bid # Get Float64 value
+            max(0.0, ask_val - bid_val) # Ensure spread is non-negative
+        else
+            missing # Store missing if either is missing
         end
-        current_option_price = !isnan(option_mid_price) ? option_mid_price : last_option_trade_price
-        # Fallback if no trades and no valid mid-price (maybe use previous step's?) - for now, keep NaN if undetermined
-        push!(option_price_history, current_option_price)
+        push!(spread_history, step_spread)
 
+        # --- Option Price History (Theoretical Fair Value) ---
+        # Record the fair value calculated by a reference agent (MM1) 
+        # using the current market state and their estimated volatility.
+        # This provides a smoother view than post-trade mid-price or last trade.
+        mm1 = agent_map[1] # Assume Agent 1 is the reference market maker
+        mm1_est_vol = mm1.estimated_volatility["STOCK"] # Use MM1's current vol estimate for the underlying
+        # Ensure volatility is not NaN before pricing
+        if isnan(mm1_est_vol)
+            # Fallback strategy if vol is NaN (e.g., use market state vol or a default)
+            println("Warning: MM1 estimated volatility is NaN at step $step. Using market state volatility.")
+            mm1_est_vol = state.volatility["STOCK"]
+        end
+        # Create a local RNG for this pricing call using the agent's seed
+        agent_rng = MersenneTwister(mm1.rng_seed)
+        # Calculate theoretical fair value using the current state (S, t) and MM1's vol
+        theoretical_fair_value = Pricing.price_american_mc(opt, state, config, agent_rng, mm1_est_vol)
+        push!(option_price_history, theoretical_fair_value)
+        
         # --- Process Trades and Update Agents --- 
         for trade in trades
             buyer = agent_map[trade[:buyer_id]]
@@ -171,43 +204,18 @@ function run_simulation(config::SimConfig, n_steps::Int)
             seller.position[asset_key] = get(seller.position, asset_key, 0.0) - trade_size
             
             # Clean up zero positions (optional)
-            if abs(buyer.position[asset_key]) < 1e-9; delete!(buyer.position, asset_key); end
-            if abs(seller.position[asset_key]) < 1e-9; delete!(seller.position, asset_key); end
+            if haskey(buyer.position, asset_key) && abs(buyer.position[asset_key]) < 1e-9; delete!(buyer.position, asset_key); end
+            if haskey(seller.position, asset_key) && abs(seller.position[asset_key]) < 1e-9; delete!(seller.position, asset_key); end
 
             # Update market state price using the correct Price constructor
             state.prices[asset_key] = Price(trade_price)
 
-            # Update agent price history and vol estimate based on the traded asset
-            current_price = trade_price
-            
-            # Ensure history vector exists before pushing
-            if !haskey(buyer.price_history, asset_key); buyer.price_history[asset_key] = Float64[]; end
-            push!(buyer.price_history[asset_key], current_price)
-            if !haskey(seller.price_history, asset_key); seller.price_history[asset_key] = Float64[]; end
-            push!(seller.price_history[asset_key], current_price)
-            
-            # Keep history within lookback window
-            if length(buyer.price_history[asset_key]) > config.vol_lookback + 1 # Need N+1 points for N returns
-                popfirst!(buyer.price_history[asset_key])
-            end
-            if length(seller.price_history[asset_key]) > config.vol_lookback + 1 # Need N+1 points for N returns
-                popfirst!(seller.price_history[asset_key])
-            end
-            
-            # Calculate new volatility estimate
-            # Ensure volatility entry exists before potentially updating
-            initial_stock_vol = state.volatility["STOCK"] # Get initial stock vol (might need adjustment if state vol changes)
-            if !haskey(buyer.estimated_volatility, asset_key); buyer.estimated_volatility[asset_key] = initial_stock_vol; end
-            new_vol_estimate_buyer = calculate_volatility(buyer.price_history[asset_key])
-            if !isnan(new_vol_estimate_buyer)
-                buyer.estimated_volatility[asset_key] = new_vol_estimate_buyer
-            end # Otherwise, keep the existing estimate
-            
-            if !haskey(seller.estimated_volatility, asset_key); seller.estimated_volatility[asset_key] = initial_stock_vol; end
-            new_vol_estimate_seller = calculate_volatility(seller.price_history[asset_key])
-            if !isnan(new_vol_estimate_seller)
-                seller.estimated_volatility[asset_key] = new_vol_estimate_seller
-            end # Otherwise, keep the existing estimate
+            # --- REMOVED: Redundant Price History / Vol Update based on Trade --- 
+            # This logic is now handled for all agents at the start of the step
+            # based on the market price, ensuring consistent vol estimates.
+
+            # --- Update Log Counters --- 
+            step_volume += trade_size
         end
 
         # --- Market State Evolution --- 

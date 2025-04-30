@@ -28,7 +28,7 @@ config = SimConfig(
     10000,                                  # Number of Monte Carlo paths
     rand(UInt),                             # RNG seed for reproducibility (now random)
     0.05,                                   # Risk premium (not risk-free rate)
-    0.001,                                  # mm_transaction_cost: Low for market makers
+    0.005,                                  # mm_transaction_cost: Increased for wider MM spread
     0.01,                                   # retail_transaction_cost: High for retail
     0.005,                                  # insurer_transaction_cost: Medium for insurers
     0.1,                                    # hedge_threshold: Minimum hedge adjustment size
@@ -90,13 +90,12 @@ println("\nGenerating plots...")
 steps_state = 0:n_steps  # For stock price, agent capital/pnl (n_steps + 1 points)
 steps_market = 1:n_steps # For option price, delta, spread, volume (n_steps points)
 
-# 1. Prices (Stock & Option)
-p_prices = plot(steps_state, stock_price_history, label="Stock Price", title="Prices", xlabel="Step", ylabel="Price", legend=:topright)
-# Plot option price against steps 1 to n_steps
-plot!(p_prices, steps_market, option_price_history, label="Option Price", linestyle=:dash)
+# 1. Spot and Option Prices (Option on secondary axis)
+p_prices = plot(steps_state, stock_price_history, title="Spot & Option Prices", xlabel="Step", ylabel="Spot Price", label="Spot Price (LHS)", legend=:outertopright, color=:blue)
+plot!(twinx(), steps_market, option_price_history, ylabel="Option Price", label="Option Price (RHS)", color=:red) # Use steps_market for option price
 
 # 2. Option Delta
-p_delta = plot(steps_market, delta_history, title="Option Delta (BS)", xlabel="Step", ylabel="Delta", label="Delta", color=:red)
+p_delta = plot(steps_market, delta_history, title="Option Delta (BS)", xlabel="Step", ylabel="Delta", label="Delta", legend=false, color=:green) # Use steps_market for delta
 
 # 3. Bid-Ask Spread
 # Filter out NaNs for plotting if necessary, or Plots.jl might handle them
@@ -104,13 +103,6 @@ p_spread = plot(steps_market, spread_history, title="Bid-Ask Spread", xlabel="St
 
 # 4. Trade Volume
 p_volume = plot(steps_market, volume_history, title="Trade Volume", xlabel="Step", ylabel="Volume", label="Volume", color=:purple, linetype=:steppre) # Use step plot for volume
-
-# 5. Agent Capital
-p_capital = plot(title="Agent Capital", xlabel="Step", ylabel="Capital", legend=:outertopright)
-for agent_id in agent_ids
-    role = agent_roles[findfirst(id -> id == agent_id, agent_ids)]
-    plot!(p_capital, steps_state, agent_capital_history[agent_id], label="Agent $agent_id ($role)")
-end
 
 # 6. Agent P&L
 p_pnl = plot(title="Agent P&L", xlabel="Step", ylabel="P&L", legend=:outertopright)
@@ -120,8 +112,8 @@ for agent_id in agent_ids
 end
 
 # Combine plots
-combined_plot = plot(p_prices, p_delta, p_spread, p_volume, p_capital, p_pnl,
-                     layout=(3, 2), size=(1200, 900), margin=5Plots.mm) # Add margin
+combined_plot = plot(p_prices, p_delta, p_spread, p_volume, p_pnl,
+                     layout=(3, 2), size=(1200, 900), margin=5Plots.mm) # Layout remains 3x2, last slot empty
 
 # Save plot
 plot_filename = "catallaxy_agent_results.png"

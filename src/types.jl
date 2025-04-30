@@ -7,6 +7,7 @@ module Types
 
 # Import only what's needed for this module
 using Random: AbstractRNG
+import Base: isless, ==, -
 
 # Export types for use in other modules
 export Price, Position, MaybeFloat, SimConfig, Agent, MarketState, OptionContract, OrderBook, Entrepreneur
@@ -21,6 +22,19 @@ struct Price{T<:Real} <: Number
         new{T}(val)
     end
 end
+
+# Define comparison methods for Price
+isless(p1::Price, p2::Price) = isless(p1.value, p2.value)
+==(p1::Price, p2::Price) = (p1.value == p2.value)
+
+# Define comparison methods between Price and Real
+isless(p::Price, x::Real) = isless(p.value, x)
+isless(x::Real, p::Price) = isless(x, p.value)
+==(p::Price, x::Real) = (p.value == x)
+==(x::Real, p::Price) = (x == p.value)
+
+# Define subtraction for Price (returns the difference as a Float64)
+-(p1::Price, p2::Price)::Float64 = p1.value - p2.value
 
 struct Position{T<:Real}
     asset::String
@@ -62,11 +76,17 @@ struct OptionContract
     is_american::Bool        # American or European
 end
 
+"""
+Represents the limit order book for a single instrument.
+Stores bids and asks as vectors of tuples: (Price{Float64}, Size::Float64, AgentID::Int, AgentRole::Symbol).
+"""
 struct OrderBook
-    bids::Vector{Tuple{Price{Float64}, Float64}} # (price, size)
-    asks::Vector{Tuple{Price{Float64}, Float64}} # (price, size)
-    depth::Int                            # Number of levels
+    # Store Price, Size, AgentID, AgentRole
+    bids::Vector{Tuple{Price{Float64}, Float64, Int, Symbol}} 
+    asks::Vector{Tuple{Price{Float64}, Float64, Int, Symbol}} 
 end
+# Default constructor for empty book
+OrderBook() = OrderBook(Tuple{Price{Float64}, Float64, Int, Symbol}[], Tuple{Price{Float64}, Float64, Int, Symbol}[]) 
 
 mutable struct Entrepreneur <: Agent
     id::Int
