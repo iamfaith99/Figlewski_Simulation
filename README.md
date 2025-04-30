@@ -28,7 +28,7 @@ A decentralized, behavioral option market model integrating:
 ## References
 - Figlewski, S. (1989, 2017)
 - Brandimarte, P. (Ch8, Ch10)
-- Glasserman, P. (Monte Carlo Methods)
+- Glasserman, P. (Monte Carlo Methods in Financial Engineering)
 
 ## Usage
 1. Ensure Julia is installed.
