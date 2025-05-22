@@ -35,17 +35,6 @@ function run_simulation(config::SimConfig, n_steps::Int)
     # Initialize reproducible RNG with explicit seed
     rng = MersenneTwister(config.seed)                # Pure functional RNG
     
-    # Initialize market state (using "STOCK" as the underlying key)
-    state = MarketState(
-        Dict("STOCK" => Price(100.0)),               # Initial underlying price
-        Dict("STOCK" => 0.2),                       # Initial underlying volatility
-        Dict("STOCK" => 1000.0),                    # Initial underlying liquidity (depth)
-        0.0                                           # Initial time
-    )
-    
-    # Initialize order book
-    ob = OrderBook()                         # Use default empty book constructor
-    
     # Define option contract
     opt = OptionContract(
         "STOCK",                                      # Underlying asset
@@ -54,6 +43,17 @@ function run_simulation(config::SimConfig, n_steps::Int)
         false,                                        # Put option
         true                                          # American style
     )
+
+    # Initialize market state
+    state = MarketState(
+        Dict(opt.underlying => Price(100.0)),        # Initial underlying price
+        Dict(opt.underlying => 0.2),                # Initial underlying volatility
+        Dict(opt.underlying => 1000.0),             # Initial underlying liquidity (depth)
+        0.0                                           # Initial time
+    )
+    
+    # Initialize order book
+    ob = OrderBook()                         # Use default empty book constructor
     
     # Initialize agents
     agents = initialize_agents(config, opt, state)
@@ -62,7 +62,7 @@ function run_simulation(config::SimConfig, n_steps::Int)
     agent_map = Dict(agent.id => agent for agent in agents)
 
     # --- Data Logging Initialization ---
-    price_history = [state.prices["STOCK"].value]
+    price_history = [state.prices[opt.underlying].value]
     # New Histories:
     delta_history = Float64[]
     spread_history = Float64[]
@@ -78,9 +78,9 @@ function run_simulation(config::SimConfig, n_steps::Int)
     for step in 1:n_steps
         # --- Update All Agents' Volatility Estimates --- 
         # Before agents decide actions, update their view of market vol based on current price
-        current_stock_price = state.prices["STOCK"].value
+        current_stock_price = state.prices[opt.underlying].value
         for agent in agents
-            asset_key = "STOCK"
+            asset_key = opt.underlying
             # Ensure history vector exists
             if !haskey(agent.price_history, asset_key); agent.price_history[asset_key] = Float64[]; end
             # Append current market price
@@ -93,28 +93,15 @@ function run_simulation(config::SimConfig, n_steps::Int)
             agent.estimated_volatility[asset_key] = calculate_volatility(agent.price_history[asset_key])
             # Handle potential NaN from calculate_volatility (e.g., if history is still too short)
             if isnan(agent.estimated_volatility[asset_key])
-                agent.estimated_volatility[asset_key] = 0.0 # Default to 0 vol if NaN
-                # Or consider using the market state vol: state.volatility[asset_key]
+                agent.estimated_volatility[asset_key] = state.volatility[asset_key] # Fallback to market state vol if NaN
             end
         end
         
         # --- Agent Actions Phase ---
         orders = Dict{Symbol, Any}[] # Initialize with specific type
         for agent in agents
-            # 1. Update Agent's Price History & Volatility Estimate
-            current_price = state.prices["STOCK"].value
-            push!(agent.price_history["STOCK"], current_price)
-            # Keep history within lookback window
-            if length(agent.price_history["STOCK"]) > config.vol_lookback + 1 # Need N+1 points for N returns
-                popfirst!(agent.price_history["STOCK"])
-            end
-            # Calculate new volatility estimate
-            new_vol_estimate = calculate_volatility(agent.price_history["STOCK"])
-            if !isnan(new_vol_estimate)
-                agent.estimated_volatility["STOCK"] = new_vol_estimate
-            end # Otherwise, keep the previous estimate
-
-            # 2. Agent decides action based on current state and their estimated vol
+            # Volatility is now updated once for all agents before this loop.
+            # Agent decides action based on current state and their estimated vol
             agent_rng = MersenneTwister(agent.rng_seed + step) # Agent-specific RNG for this step
             action = decide_action(agent, state, config, agent_rng, opt) # Use agent's vol via agent struct
             
@@ -160,12 +147,12 @@ function run_simulation(config::SimConfig, n_steps::Int)
         # using the current market state and their estimated volatility.
         # This provides a smoother view than post-trade mid-price or last trade.
         mm1 = agent_map[1] # Assume Agent 1 is the reference market maker
-        mm1_est_vol = mm1.estimated_volatility["STOCK"] # Use MM1's current vol estimate for the underlying
+        mm1_est_vol = mm1.estimated_volatility[opt.underlying] # Use MM1's current vol estimate for the underlying
         # Ensure volatility is not NaN before pricing
         if isnan(mm1_est_vol)
             # Fallback strategy if vol is NaN (e.g., use market state vol or a default)
             println("Warning: MM1 estimated volatility is NaN at step $step. Using market state volatility.")
-            mm1_est_vol = state.volatility["STOCK"]
+            mm1_est_vol = state.volatility[opt.underlying]
         end
         # Create a local RNG for this pricing call using the agent's seed
         agent_rng = MersenneTwister(mm1.rng_seed)
@@ -219,17 +206,17 @@ function run_simulation(config::SimConfig, n_steps::Int)
         end
 
         # --- Market State Evolution --- 
-        state = evolve_market(state, config, rng)  # Evolve underlying price/vol
-        push!(price_history, state.prices["STOCK"].value) # Log new stock price
+        state = evolve_market(state, config, rng, opt.underlying)  # Evolve underlying price/vol
+        push!(price_history, state.prices[opt.underlying].value) # Log new stock price
 
         # --- Calculate Delta (End of Step) ---
-        S = state.prices["STOCK"].value
+        S = state.prices[opt.underlying].value
         K = opt.strike
         T = max(1e-9, (n_steps - step) / n_steps) # Time to expiry in years, ensure > 0
         # Use risk_premium as r? Or 0? Using 0 for theoretical delta for now.
-        r = 0.0 
+        r = config.risk_premium 
         # Which sigma? Use market state's sigma for now.
-        sigma = state.volatility["STOCK"]
+        sigma = state.volatility[opt.underlying]
         # Handle T=0 case (expiration) - already handled by Pricing.calculate_delta if T is small but positive
         step_delta = Pricing.calculate_bs_delta(S, K, T, r, sigma, opt.is_call) # Use calculate_bs_delta
         push!(delta_history, step_delta)
@@ -238,7 +225,7 @@ function run_simulation(config::SimConfig, n_steps::Int)
         for agent in agents
             # Calculate current portfolio value: Capital + MTM value of stock position
             # Use get() for agent.position to handle cases where agent has no stock position
-            mtm_position_value = get(agent.position, "STOCK", 0.0) * state.prices["STOCK"].value
+            mtm_position_value = get(agent.position, opt.underlying, 0.0) * state.prices[opt.underlying].value
             current_portfolio_value = agent.capital + mtm_position_value
             push!(agent.portfolio_history, current_portfolio_value)
 
@@ -248,7 +235,7 @@ function run_simulation(config::SimConfig, n_steps::Int)
 
         # Optional: Print progress
         if step % 50 == 0 || step == n_steps
-            println("Step $step/$n_steps completed. Price: $(round(state.prices["STOCK"].value, digits=2))")
+            println("Step $step/$n_steps completed. Price: $(round(state.prices[opt.underlying].value, digits=2))")
         end
     end
     
@@ -267,26 +254,25 @@ function initialize_agents(config::SimConfig, option::OptionContract, initial_st
     option_key = "OPTION_$(option.strike)_$(option.is_call ? 'C' : 'P')"
     
     # Get initial volatility from the market state
-    initial_vol = initial_state.volatility["STOCK"]
+    initial_vol = initial_state.volatility[option.underlying]
 
     # 1. Market Maker - Use hardcoded initial capital
     mm_initial_capital = 10_000_000.0  # Increased x10
-    # Initialize using positional arguments matching the struct definition
-    # id, initial_capital, capital, risk_aversion, role, position, estimated_volatility, price_history, accumulated_costs, portfolio_history, stop_loss, margin_limit, rng_seed
+    # Initialize using keyword arguments
     push!(agents, Entrepreneur(
-        1, # id
-        mm_initial_capital, # initial_capital
-        mm_initial_capital, # capital (starts equal to initial)
-        0.2, # risk_aversion (low for market makers)
-        :market_maker, # role
-        Dict{String, Float64}(), # position (empty to start)
-        Dict(option.underlying => initial_vol), # estimated_volatility
-        Dict(option.underlying => [initial_state.prices[option.underlying].value]), # price_history
-        0.0, # accumulated_costs
-        Float64[], # portfolio_history (empty vector of Float64)
-        missing, # stop_loss
-        missing, # margin_limit
-        rand(rng, 1:10000) # rng_seed as Int
+        id = 1,
+        initial_capital = mm_initial_capital,
+        capital = mm_initial_capital,
+        risk_aversion = 0.2, # low for market makers
+        role = :market_maker,
+        position = Dict{String, Float64}(), # empty to start
+        estimated_volatility = Dict(option.underlying => initial_vol),
+        price_history = Dict(option.underlying => [initial_state.prices[option.underlying].value]),
+        accumulated_costs = 0.0,
+        portfolio_history = Float64[], # empty vector of Float64
+        stop_loss = missing,
+        margin_limit = missing,
+        rng_seed = rand(rng, 1:10000)
     ))
 
     # 2. Portfolio Insurer 
@@ -294,113 +280,116 @@ function initialize_agents(config::SimConfig, option::OptionContract, initial_st
     insurer_initial_pos = Dict{String, Float64}() # Use Dict constructor
     insurer_initial_pos[option_key] = -1.0 # Short 1 option
     insurer_initial_capital = 5_000_000.0  # Increased x10
-    # Initialize using positional arguments matching the struct definition
-    # id, initial_capital, capital, risk_aversion, role, position, estimated_volatility, price_history, accumulated_costs, portfolio_history, stop_loss, margin_limit, rng_seed
+    # Initialize using keyword arguments
     push!(agents, Entrepreneur(
-        2, # id
-        insurer_initial_capital, # initial_capital
-        insurer_initial_capital, # capital (starts equal to initial)
-        0.5, # risk_aversion (medium)
-        :insurer, # role
-        insurer_initial_pos, # position (short 1 option)
-        Dict(option.underlying => initial_vol), # estimated_volatility
-        Dict(option.underlying => [initial_state.prices[option.underlying].value]), # price_history
-        0.0, # accumulated_costs
-        Float64[], # portfolio_history (empty vector of Float64)
-        missing, # stop_loss
-        missing, # margin_limit
-        rand(rng, 1:10000) # rng_seed as Int
+        id = 2,
+        initial_capital = insurer_initial_capital,
+        capital = insurer_initial_capital,
+        risk_aversion = 0.5, # medium
+        role = :insurer,
+        position = insurer_initial_pos, # short 1 option
+        estimated_volatility = Dict(option.underlying => initial_vol),
+        price_history = Dict(option.underlying => [initial_state.prices[option.underlying].value]),
+        accumulated_costs = 0.0,
+        portfolio_history = Float64[], # empty vector of Float64
+        stop_loss = missing,
+        margin_limit = missing,
+        rng_seed = rand(rng, 1:10000)
     ))
 
     # 3. Retail Trader
     retail_initial_capital = 1_000_000.0 # Increased x10
-    # Initialize using positional arguments matching the struct definition
+    # Initialize using keyword arguments
     push!(agents, Entrepreneur(
-        3, # id
-        retail_initial_capital, # initial_capital
-        retail_initial_capital, # capital
-        0.5, # risk_aversion (higher than MM)
-        :retail, # role
-        Dict{String, Float64}(), # position
-        Dict(option.underlying => initial_vol), # estimated_volatility
-        Dict(option.underlying => [initial_state.prices[option.underlying].value]), # price_history
-        0.0, # accumulated_costs
-        Float64[], # portfolio_history
-        missing, # stop_loss
-        missing, # margin_limit
-        rand(rng, 1:10000) # rng_seed
+        id = 3,
+        initial_capital = retail_initial_capital,
+        capital = retail_initial_capital,
+        risk_aversion = 0.5, # higher than MM
+        role = :retail,
+        position = Dict{String, Float64}(),
+        estimated_volatility = Dict(option.underlying => initial_vol),
+        price_history = Dict(option.underlying => [initial_state.prices[option.underlying].value]),
+        accumulated_costs = 0.0,
+        portfolio_history = Float64[],
+        stop_loss = missing,
+        margin_limit = missing,
+        rng_seed = rand(rng, 1:10000)
     ))
 
     # 4. Retail Trader 2
     retail2_initial_capital = 900_000.0 # Increased x10
+    # Initialize using keyword arguments
     push!(agents, Entrepreneur(
-        4, # id
-        retail2_initial_capital, # initial_capital
-        retail2_initial_capital, # capital
-        0.6, # risk_aversion (slightly higher)
-        :retail, # role
-        Dict{String, Float64}(), # position
-        Dict(option.underlying => initial_vol), # estimated_volatility
-        Dict(option.underlying => [initial_state.prices[option.underlying].value]), # price_history
-        0.0, # accumulated_costs
-        Float64[], # portfolio_history
-        missing, # stop_loss
-        missing, # margin_limit
-        rand(rng, 1:10000) # rng_seed
+        id = 4,
+        initial_capital = retail2_initial_capital,
+        capital = retail2_initial_capital,
+        risk_aversion = 0.6, # slightly higher
+        role = :retail,
+        position = Dict{String, Float64}(),
+        estimated_volatility = Dict(option.underlying => initial_vol),
+        price_history = Dict(option.underlying => [initial_state.prices[option.underlying].value]),
+        accumulated_costs = 0.0,
+        portfolio_history = Float64[],
+        stop_loss = missing,
+        margin_limit = missing,
+        rng_seed = rand(rng, 1:10000)
     ))
 
     # 5. Retail Trader 3
     retail3_initial_capital = 1_100_000.0 # Increased x10
+    # Initialize using keyword arguments
     push!(agents, Entrepreneur(
-        5, # id
-        retail3_initial_capital, # initial_capital
-        retail3_initial_capital, # capital
-        0.4, # risk_aversion (slightly lower)
-        :retail, # role
-        Dict{String, Float64}(), # position
-        Dict(option.underlying => initial_vol), # estimated_volatility
-        Dict(option.underlying => [initial_state.prices[option.underlying].value]), # price_history
-        0.0, # accumulated_costs
-        Float64[], # portfolio_history
-        missing, # stop_loss
-        missing, # margin_limit
-        rand(rng, 1:10000) # rng_seed
+        id = 5,
+        initial_capital = retail3_initial_capital,
+        capital = retail3_initial_capital,
+        risk_aversion = 0.4, # slightly lower
+        role = :retail,
+        position = Dict{String, Float64}(),
+        estimated_volatility = Dict(option.underlying => initial_vol),
+        price_history = Dict(option.underlying => [initial_state.prices[option.underlying].value]),
+        accumulated_costs = 0.0,
+        portfolio_history = Float64[],
+        stop_loss = missing,
+        margin_limit = missing,
+        rng_seed = rand(rng, 1:10000)
     ))
 
     # 6. Market Maker 2 (Competing)
     mm2_initial_capital = 9_500_000.0 # Increased x10
+    # Initialize using keyword arguments
     push!(agents, Entrepreneur(
-        6, # id
-        mm2_initial_capital, # initial_capital
-        mm2_initial_capital, # capital
-        0.25, # risk_aversion (slightly higher than MM1)
-        :market_maker, # role
-        Dict{String, Float64}(), # position
-        Dict(option.underlying => initial_vol), # estimated_volatility
-        Dict(option.underlying => [initial_state.prices[option.underlying].value]), # price_history
-        0.0, # accumulated_costs
-        Float64[], # portfolio_history
-        missing, # stop_loss
-        missing, # margin_limit
-        rand(rng, 1:10000) # rng_seed
+        id = 6,
+        initial_capital = mm2_initial_capital,
+        capital = mm2_initial_capital,
+        risk_aversion = 0.25, # slightly higher than MM1
+        role = :market_maker,
+        position = Dict{String, Float64}(),
+        estimated_volatility = Dict(option.underlying => initial_vol),
+        price_history = Dict(option.underlying => [initial_state.prices[option.underlying].value]),
+        accumulated_costs = 0.0,
+        portfolio_history = Float64[],
+        stop_loss = missing,
+        margin_limit = missing,
+        rng_seed = rand(rng, 1:10000)
     ))
 
     # 7. Arbitrageur
     arb_initial_capital = 2_000_000.0 # Increased x10
+    # Initialize using keyword arguments
     push!(agents, Entrepreneur(
-        7, # id
-        arb_initial_capital, # initial_capital
-        arb_initial_capital, # capital
-        0.1, # risk_aversion (low)
-        :arbitrageur, # role
-        Dict{String, Float64}(), # position
-        Dict(option.underlying => initial_vol), # estimated_volatility
-        Dict(option.underlying => [initial_state.prices[option.underlying].value]), # price_history
-        0.0, # accumulated_costs
-        Float64[], # portfolio_history
-        missing, # stop_loss
-        missing, # margin_limit
-        rand(rng, 1:10000) # rng_seed
+        id = 7,
+        initial_capital = arb_initial_capital,
+        capital = arb_initial_capital,
+        risk_aversion = 0.1, # low
+        role = :arbitrageur,
+        position = Dict{String, Float64}(),
+        estimated_volatility = Dict(option.underlying => initial_vol),
+        price_history = Dict(option.underlying => [initial_state.prices[option.underlying].value]),
+        accumulated_costs = 0.0,
+        portfolio_history = Float64[],
+        stop_loss = missing,
+        margin_limit = missing,
+        rng_seed = rand(rng, 1:10000)
     ))
 
     return agents

@@ -129,15 +129,11 @@ function decide_action(agent::Entrepreneur, state::MarketState, config::SimConfi
         r_proxy = config.risk_premium 
         discount_factor = exp(-r_proxy * T)
         
-        # Calculate bounds for Put (assuming option is a Put)
-        # TODO: Add logic to handle calls if necessary
-        lower_bound = max(0.0, K * discount_factor - S)
-        upper_bound = K * discount_factor # Tighter upper bound
-
         # Simulate MM1 quotes to represent market BBO
         # Needs MM1's vol estimate - use agent's own for simplicity here
         arb_fair_value = Pricing.price_american_mc(option, state, config, rng, est_vol)
-        mm_spread_factor = config.mm_transaction_cost + (0.1 * est_vol) # MM1 risk aversion = 0.1 (fixed)
+        mm_risk_aversion_proxy = 0.1 # Proxy for MM's risk aversion
+        mm_spread_factor = config.mm_transaction_cost + (mm_risk_aversion_proxy * est_vol)
         mm_spread = arb_fair_value * mm_spread_factor
         mm_bid_proxy = arb_fair_value - mm_spread / 2
         mm_ask_proxy = arb_fair_value + mm_spread / 2
@@ -147,15 +143,36 @@ function decide_action(agent::Entrepreneur, state::MarketState, config::SimConfi
         capital_scale = max(1.0, agent.capital / base_capital)
         arb_order_size = round(capital_scale) # Round to integer size
 
-        # Check for arbitrage opportunities
-        if mm_ask_proxy < lower_bound * 0.999 # Ask is significantly below lower bound -> BUY
-            # Price is too low, buy the option
-            push!(orders, Dict(:type => :option, :side => :buy, :price => mm_ask_proxy, :size => arb_order_size, :agent_role => agent.role, :agent_id => agent.id, :option_key => option_key))
-            # TODO: Potentially hedge by buying underlying stock
-        elseif mm_bid_proxy > upper_bound * 1.001 # Bid is significantly above upper bound -> SELL
-            # Price is too high, sell the option
-            push!(orders, Dict(:type => :option, :side => :sell, :price => mm_bid_proxy, :size => arb_order_size, :agent_role => agent.role, :agent_id => agent.id, :option_key => option_key))
-            # TODO: Potentially hedge by selling underlying stock
+        if option.is_call
+            # Calculate bounds for Call
+            lower_bound = max(0.0, S - K * discount_factor)
+            upper_bound = S 
+
+            # Check for arbitrage opportunities for Call
+            if mm_ask_proxy < lower_bound * 0.999 # Ask is significantly below lower bound -> BUY
+                # Price is too low, buy the option
+                push!(orders, Dict(:type => :option, :side => :buy, :price => mm_ask_proxy, :size => arb_order_size, :agent_role => agent.role, :agent_id => agent.id, :option_key => option_key))
+                # TODO: Potentially hedge by selling underlying stock
+            elseif mm_bid_proxy > upper_bound * 1.001 # Bid is significantly above upper bound -> SELL
+                # Price is too high, sell the option
+                push!(orders, Dict(:type => :option, :side => :sell, :price => mm_bid_proxy, :size => arb_order_size, :agent_role => agent.role, :agent_id => agent.id, :option_key => option_key))
+                # TODO: Potentially hedge by buying underlying stock
+            end
+        else # It's a Put option
+            # Calculate bounds for Put
+            lower_bound = max(0.0, K * discount_factor - S)
+            upper_bound = K * discount_factor # Tighter upper bound
+
+            # Check for arbitrage opportunities for Put
+            if mm_ask_proxy < lower_bound * 0.999 # Ask is significantly below lower bound -> BUY
+                # Price is too low, buy the option
+                push!(orders, Dict(:type => :option, :side => :buy, :price => mm_ask_proxy, :size => arb_order_size, :agent_role => agent.role, :agent_id => agent.id, :option_key => option_key))
+                # TODO: Potentially hedge by buying underlying stock
+            elseif mm_bid_proxy > upper_bound * 1.001 # Bid is significantly above upper bound -> SELL
+                # Price is too high, sell the option
+                push!(orders, Dict(:type => :option, :side => :sell, :price => mm_bid_proxy, :size => arb_order_size, :agent_role => agent.role, :agent_id => agent.id, :option_key => option_key))
+                # TODO: Potentially hedge by selling underlying stock
+            end
         end
         # Otherwise, do nothing if price is within bounds
 

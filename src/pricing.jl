@@ -71,6 +71,15 @@ function price_american_mc(opt::OptionContract, state::MarketState, config::SimC
     dt = 1.0/252
     nsteps = Int(round(T/dt))
 
+    # Handle very short maturities (less than one time step)
+    if nsteps == 0
+        if opt.is_call
+            return max(0.0, S0 - K)
+        else # Put
+            return max(0.0, K - S0)
+        end
+    end
+
     # Simulate stock price paths
     S_paths = zeros(nsteps + 1, npaths)
     S_paths[1, :] .= S0
