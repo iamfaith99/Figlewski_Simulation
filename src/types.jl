@@ -88,7 +88,7 @@ end
 # Default constructor for empty book
 OrderBook() = OrderBook(Tuple{Price{Float64}, Float64, Int, Symbol}[], Tuple{Price{Float64}, Float64, Int, Symbol}[]) 
 
-mutable struct Entrepreneur <: Agent
+@kwdef mutable struct Entrepreneur <: Agent
     id::Int
     initial_capital::Float64             # Starting capital for P&L calc
     capital::Float64                     # Current liquid capital
