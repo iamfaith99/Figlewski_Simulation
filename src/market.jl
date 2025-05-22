@@ -108,9 +108,23 @@ function update_orderbook(ob::OrderBook, orders::Vector{Dict{Symbol, Any}}, stat
             # Find if price level exists (matching on Price only)
             found_idx = findfirst(item -> item[1] == price, target_list)
             if !isnothing(found_idx)
-                # Aggregate size and store *one* agent's info (e.g., the last one)
-                # TODO: A better approach would handle multiple orders at the same price level
-                # For now, just update the size and overwrite agent info
+                # TODO MAJOR: Current order aggregation at a price level is a simplification.
+                # It sums total size at a price level but only stores the (AgentID, AgentRole) 
+                # of the *last* incoming order that contributed to (or created) this specific price level. 
+                # This means:
+                #   1. If multiple agents have orders at the same best price, only one agent's
+                #      details are associated with that price level for matching purposes.
+                #   2. Cost attribution for trades (see cost calculation note below) might use
+                #      this simplified agent info, potentially leading to inaccuracies if the
+                #      matched agent info at the BBO isn't the one whose order portion is filled.
+                #   3. Market analysis relying on specific agent contributions at various price
+                #      levels will not be accurate with this simplification.
+                # A more robust solution would involve changing the OrderBook structure 
+                # (e.g., `bids::Vector{Tuple{Price, Vector{Tuple{Float64, Int, Symbol}}}}` 
+                # to store Price -> List of (Size, AgentID, AgentRole))
+                # to track individual orders or detailed agent contributions within an aggregated price level.
+                # This would significantly impact matching logic, deepcopy, and data handling.
+                # For now, accepting this limitation: update total size and overwrite agent info with the last incoming order's details.
                 existing_price, existing_size, _, _ = target_list[found_idx]
                 target_list[found_idx] = (existing_price, existing_size + size, agent_id, agent_role)
             else
@@ -134,8 +148,15 @@ function update_orderbook(ob::OrderBook, orders::Vector{Dict{Symbol, Any}}, stat
                 trade_size = min(best_bid_size, best_ask_size)
 
                 # --- Calculate Costs using Agent Info from Book --- 
-                # Note: This uses the agent info associated with the *first* tuple at the BBO.
-                # If multiple orders were aggregated, this might not be fully accurate.
+                # NOTE ON COST ATTRIBUTION: Cost calculation uses the AgentID and AgentRole 
+                # retrieved from the best bid/ask price level data in the `updated_bids`/`updated_asks`
+                # lists (i.e., `buyer_id, buyer_role` and `seller_id, seller_role`). 
+                # Due to the current order aggregation simplification (see TODO MAJOR above on aggregation), 
+                # this agent information represents the *last* order that formed or added to this 
+                # specific price level. It does not necessarily reflect all individual orders that might 
+                # constitute that price level, nor does it guarantee that this specific agent's order is 
+                # the one being matched if the level represents aggregated volume. This can lead to 
+                # misattribution of transaction costs if precise per-agent, per-order cost tracking is critical.
                 buyer_cost_total = apply_costs(trade_price, trade_size, :buy, buyer_role, config, state, option) 
                 seller_cost_total = apply_costs(trade_price, trade_size, :sell, seller_role, config, state, option)
 
@@ -217,17 +238,17 @@ function apply_costs(price::Float64, size::Float64, side::Symbol, role::Symbol, 
 end
 
 """
-evolve_market(state::MarketState, config::SimConfig, rng::AbstractRNG)
+evolve_market(state::MarketState, config::SimConfig, rng::AbstractRNG, underlying_asset_key::String)
 
 Evolves the underlying market state (e.g., stock price) using GBM.
-- Assumes a single underlying asset "STOCK".
+- Uses the provided `underlying_asset_key`.
 - Uses risk premium from config as the drift `mu`.
 - Returns a new `MarketState`.
 """
-function evolve_market(state::MarketState, config::SimConfig, rng::AbstractRNG)
+function evolve_market(state::MarketState, config::SimConfig, rng::AbstractRNG, underlying_asset_key::String)
     # --- Evolve Underlying Asset Price (GBM) --- 
-    current_price = state.prices["STOCK"].value
-    sigma = state.volatility["STOCK"] # Use current volatility
+    current_price = state.prices[underlying_asset_key].value
+    sigma = state.volatility[underlying_asset_key] # Use current volatility
     mu = config.risk_premium          # Use risk premium as drift 
     dt = 1.0 / 252.0                 # Time step (daily)
     Z = randn(rng)                   # Standard normal random variable
@@ -236,7 +257,7 @@ function evolve_market(state::MarketState, config::SimConfig, rng::AbstractRNG)
     next_price_val = current_price * exp((mu - 0.5 * sigma^2) * dt + sigma * sqrt(dt) * Z)
     next_price_val = max(0.01, next_price_val) # Ensure price doesn't go below a floor
     
-    new_prices = Dict("STOCK" => Price(next_price_val))
+    new_prices = Dict(underlying_asset_key => Price(next_price_val))
     
     # --- Update Volatility (Could be more complex, e.g., GARCH) ---
     # For now, keep volatility constant, but this is where it could change
